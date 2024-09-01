@@ -9,6 +9,7 @@ import dotenv from 'dotenv';
 import { createReadStream, createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import { RecursiveCharacterTextSplitter } from 'langchain/text_splitter';
+import { PDFExtract } from 'pdf.js-extract';
 
 dotenv.config();
 
@@ -24,8 +25,22 @@ if (!supabaseUrl || !supabaseKey || !openaiApiKey) {
 const supabase = createClient(supabaseUrl, supabaseKey);
 const embeddings = new OpenAIEmbeddings({ openAIApiKey: openaiApiKey });
 
+const pdfExtract = new PDFExtract();
+
 const CHUNK_SIZE = 1000;
 const CHUNK_OVERLAP = 200;
+
+async function extractTextFromPDF(filePath) {
+	return new Promise((resolve, reject) => {
+		pdfExtract.extract(filePath, {}, (err, data) => {
+			if (err) return reject(err);
+			const text = data.pages
+				.map((page) => page.content.map((item) => item.str).join(' '))
+				.join('\n');
+			resolve(text);
+		});
+	});
+}
 
 export async function POST({ request }) {
 	console.log('Upload request received');
@@ -51,8 +66,13 @@ export async function POST({ request }) {
 
 		console.log(`File saved to: ${filePath}`);
 
-		// Read the file contents
-		const fileContent = await readFileContent(filePath);
+		// Extract text content based on file type
+		let fileContent;
+		if (filename.toLowerCase().endsWith('.pdf')) {
+			fileContent = await extractTextFromPDF(filePath);
+		} else {
+			fileContent = await readFile(filePath, 'utf-8');
+		}
 
 		// Split the content into smaller chunks
 		const textSplitter = new RecursiveCharacterTextSplitter({
@@ -62,41 +82,58 @@ export async function POST({ request }) {
 
 		const docs = await textSplitter.createDocuments([fileContent]);
 
-		for (let i = 0; i < docs.length; i++) {
-			const chunk = docs[i];
+		// Set up a readable stream for progress updates
+		const encoder = new TextEncoder();
+		const readable = new ReadableStream({
+			async start(controller) {
+				for (let i = 0; i < docs.length; i++) {
+					const chunk = docs[i];
 
-			// Sanitize the content
-			const sanitizedContent = sanitizeContent(chunk.pageContent);
+					// Sanitize the content
+					const sanitizedContent = sanitizeContent(chunk.pageContent);
 
-			// Generate embedding for the chunk
-			const [embedding] = await embeddings.embedDocuments([sanitizedContent]);
+					// Generate embedding for the chunk
+					const [embedding] = await embeddings.embedDocuments([sanitizedContent]);
 
-			// Store chunk in Supabase
-			const { data: document, error } = await supabase
-				.from('documents')
-				.insert({
-					id: uuidv4(),
-					content: sanitizedContent,
-					metadata: {
-						...chunk.metadata,
-						filename,
-						type: file.type,
-						chunk: i + 1,
-						totalChunks: docs.length
-					},
-					embedding
-				})
-				.select();
+					// Store chunk in Supabase
+					const { data: document, error } = await supabase
+						.from('documents')
+						.insert({
+							id: uuidv4(),
+							content: sanitizedContent,
+							metadata: {
+								...chunk.metadata,
+								filename,
+								type: file.type,
+								chunk: i + 1,
+								totalChunks: docs.length
+							},
+							embedding
+						})
+						.select();
 
-			if (error) {
-				console.error(`Error storing chunk ${i + 1} in Supabase:`, error);
-				throw error;
+					if (error) {
+						console.error(`Error storing chunk ${i + 1} in Supabase:`, error);
+						throw error;
+					}
+
+					console.log(`Chunk ${i + 1}/${docs.length} processed and stored`);
+
+					// Send progress update
+					const progress = Math.round(((i + 1) / docs.length) * 100);
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress })}\n\n`));
+				}
+				controller.close();
 			}
+		});
 
-			console.log(`Chunk ${i + 1}/${docs.length} processed and stored`);
-		}
-
-		return json({ success: true, filename });
+		return new Response(readable, {
+			headers: {
+				'Content-Type': 'text/event-stream',
+				'Cache-Control': 'no-cache',
+				Connection: 'keep-alive'
+			}
+		});
 	} catch (error) {
 		console.error('Error processing file:', error);
 		return json({ error: 'Could not process file' }, { status: 500 });
@@ -109,6 +146,5 @@ async function readFileContent(filePath) {
 }
 
 function sanitizeContent(content) {
-	// Remove null characters and other non-printable characters
 	return content.replace(/[\x00-\x1F\x7F-\x9F]/g, '');
 }

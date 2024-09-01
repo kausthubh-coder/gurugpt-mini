@@ -5,6 +5,7 @@
 	import FloatingActionButton from '$lib/components/FloatingActionButton.svelte';
 	import QuestionModal from '$lib/components/QuestionModal.svelte';
 	import FileUpload from '$lib/components/FileUpload.svelte';
+	import { parseMarkdown } from '$lib/utils/markdown';
 
 	const { conversationStore, updateConversation } = getContext('conversation');
 
@@ -31,60 +32,126 @@
 			});
 
 			if (!response.ok) {
-				throw new Error('Failed to get AI response');
+				throw new Error(`Failed to get AI response: ${response.statusText}`);
 			}
 
 			const reader = response.body.getReader();
 			const decoder = new TextDecoder();
 			let content = '';
 			let responseReferences = [];
+			let buffer = '';
 
 			while (true) {
 				const { value, done } = await reader.read();
 				if (done) break;
 
-				const chunk = decoder.decode(value);
-				const lines = chunk.split('\n\n');
+				buffer += decoder.decode(value, { stream: true });
+				const lines = buffer.split('\n\n');
+				buffer = lines.pop() || '';
+
 				for (const line of lines) {
 					if (line.startsWith('data: ')) {
-						const data = JSON.parse(line.slice(6));
-						content = data.content;
-						progress = data.progress;
-						if (data.references) {
-							responseReferences = data.references;
+						try {
+							const data = JSON.parse(line.slice(6));
+							content = data.content || content;
+							progress = data.progress || progress;
+							if (data.references) {
+								responseReferences = data.references;
+							}
+							console.log('Received chunk:', { content, progress, references: responseReferences });
+						} catch (parseError) {
+							console.warn('Error parsing chunk:', parseError, 'Raw chunk:', line);
+							// Continue processing other chunks
 						}
 					}
 				}
 			}
 
-			isLoading = false;
+			// Process any remaining data in the buffer
+			if (buffer.startsWith('data: ')) {
+				try {
+					const data = JSON.parse(buffer.slice(6));
+					content = data.content || content;
+					progress = data.progress || progress;
+					if (data.references) {
+						responseReferences = data.references;
+					}
+				} catch (parseError) {
+					console.warn('Error parsing final chunk:', parseError, 'Raw chunk:', buffer);
+				}
+			}
+
+			console.log('AI response completed:', { content, references: responseReferences });
 			return { content, references: responseReferences };
 		} catch (error) {
 			console.error('Error fetching AI response:', error);
-			isLoading = false;
 			throw error;
+		} finally {
+			isLoading = false;
 		}
 	}
 
 	async function startLesson() {
 		if (!topic) return;
-		currentChapter = 1;
 		const { content, references } = await getAIResponse(
-			`
-      Provide a comprehensive introduction to the topic: ${topic}. 
-      This should be Chapter 1 of our lesson. 
-      Include the following:
-      1. A clear definition or explanation of ${topic}
-      2. Its importance or relevance
-      3. An overview of 3-5 key aspects or subtopics related to ${topic}
-      4. A brief history or background of ${topic} (if applicable)
-      Ensure the content is well-structured and easy to understand for a beginner.
-    `,
-			uploadedFiles
+			`Provide a comprehensive introduction to the topic: ${topic}. Start with a title in the format "Chapter 1: [Brief Title]", followed by the content.`
 		);
+		const title = extractTitle(content);
 		conversation = [
-			{ role: 'teacher', content: `Chapter 1: Introduction to ${topic}\n\n${content}`, references }
+			{
+				role: 'chapter',
+				title: title,
+				content: content.replace(title, '').trim(), // Remove the title from the content
+				references: references
+			}
 		];
+	}
+
+	async function continueLesson() {
+		if (conversation.length === 0) return;
+		const chapterNumber = conversation.filter((msg) => msg.role === 'chapter').length + 1;
+		const { content, references } = await getAIResponse(
+			`Continue the lesson on ${topic}. This should be Chapter ${chapterNumber}. Start with a title in the format "Chapter ${chapterNumber}: [Brief Title]", followed by the content.`
+		);
+		const title = extractTitle(content);
+		conversation = [
+			...conversation,
+			{
+				role: 'chapter',
+				title: title,
+				content: content.replace(title, '').trim(), // Remove the title from the content
+				references: references
+			}
+		];
+	}
+
+	async function askQuestion(question) {
+		if (!question) return;
+		isLoading = true;
+		try {
+			const { content, references } = await getAIResponse(
+				`Answer the following question about ${topic}: "${question}"`
+			);
+			conversation = [
+				...conversation,
+				{
+					role: 'qa',
+					title: `Q&A: ${question}`,
+					content: `Q: ${question}\n\nA: ${content}`,
+					references: references
+				}
+			];
+			console.log('Updated conversation:', conversation);
+		} catch (error) {
+			console.error('Error asking question:', error);
+		} finally {
+			isLoading = false;
+		}
+	}
+
+	function extractTitle(content) {
+		const match = content.match(/^Chapter \d+:.*$/m);
+		return match ? match[0].trim() : `Chapter ${conversation.length + 1}: Untitled`;
 	}
 
 	function summarizePreviousChapters(conversation, maxLength = 500) {
@@ -96,49 +163,6 @@
 			}
 		}
 		return summary.length > maxLength ? summary.substring(0, maxLength) + '...' : summary;
-	}
-
-	async function continueLesson() {
-		if (conversation.length === 0) return;
-		currentChapter++;
-
-		const previousChaptersSummary = summarizePreviousChapters(conversation);
-
-		const { content, references } = await getAIResponse(
-			`
-    Continue the lesson on ${topic}. This should be Chapter ${currentChapter}. 
-    
-    Here's a brief summary of previous chapters:
-    ${previousChaptersSummary}
-    
-    Based on this context, focus on the next logical subtopic or aspect of ${topic} that hasn't been covered yet. 
-    Your response should include:
-    1. A clear introduction to this new subtopic
-    2. Detailed explanation of key concepts
-    3. Examples or applications (if relevant)
-    4. How this subtopic relates to the overall topic of ${topic} and previously discussed concepts
-    
-    Ensure the content is distinct from previous chapters, builds upon the existing knowledge, and provides a complete explanation of this subtopic. Avoid repeating information already covered in previous chapters.
-  `,
-			uploadedFiles
-		);
-
-		conversation = [
-			...conversation,
-			{ role: 'ai', content: `Chapter ${currentChapter}: ${content}`, references }
-		];
-	}
-
-	async function askQuestion(question) {
-		if (!question) return;
-		const { content, references } = await getAIResponse(
-			`The student has asked the following question about ${topic}: "${question}". Please provide a comprehensive answer in the context of our current lesson.`,
-			uploadedFiles
-		);
-		conversation = [
-			...conversation,
-			{ role: 'qa', content: `Q: ${question}\n\nA: ${content}`, references }
-		];
 	}
 
 	function handleKeydown(event) {
@@ -236,14 +260,25 @@
 
 				<!-- Conversation / Chapters -->
 				<div class="space-y-8">
-					{#each conversation as message, index}
-						<div data-chapter={index + 1}>
-							<ChapterCard {message} chapterIndex={index + 1} />
-							{#if message.references && message.references.length > 0}
+					{#each conversation as item, index}
+						<div data-index={index}>
+							{#if item.role === 'chapter'}
+								<ChapterCard {item} {index} />
+							{:else if item.role === 'qa'}
+								<div class="card bg-base-200 shadow-xl mb-4 rounded-lg overflow-hidden w-full">
+									<div class="card-body">
+										<h2 class="card-title">{item.title}</h2>
+										<div class="prose">
+											{@html parseMarkdown(item.content)}
+										</div>
+									</div>
+								</div>
+							{/if}
+							{#if item.references && item.references.length > 0}
 								<div class="mt-4 bg-base-200 p-4 rounded-lg shadow-md">
 									<h4 class="font-medium mb-2">References:</h4>
 									<ul class="list-disc list-inside space-y-2">
-										{#each message.references as ref}
+										{#each item.references as ref}
 											<li class="text-sm">
 												<span class="font-medium">Score: {ref.similarity.toFixed(4)}</span>
 												<br />

@@ -43,6 +43,8 @@
 		"langchain": "^0.2.17",
 		"marked": "^14.1.0",
 		"openai": "^4.56.1",
+		"pdf-parse": "^1.1.1",
+		"pdf.js-extract": "^0.2.1",
 		"uuid": "^10.0.0"
 	}
 }

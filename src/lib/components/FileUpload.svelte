@@ -9,7 +9,6 @@
 	let uploadProgress = 0;
 	let uploadStatus = '';
 	let processingProgress = 0;
-	let totalChunks = 0;
 
 	async function handleFileSelect(event) {
 		const selectedFiles = Array.from(event.target.files);
@@ -33,35 +32,26 @@
 				}
 
 				const reader = response.body.getReader();
-				const contentLength = +response.headers.get('Content-Length');
+				const decoder = new TextDecoder();
 
-				let receivedLength = 0;
 				while (true) {
 					const { done, value } = await reader.read();
 					if (done) break;
-					receivedLength += value.length;
-					uploadProgress = (receivedLength / contentLength) * 100;
 
-					// Parse the chunks from the response
-					const chunkInfo = new TextDecoder().decode(value);
-					const match = chunkInfo.match(/Chunk (\d+)\/(\d+)/);
-					if (match) {
-						const [, currentChunk, totalChunks] = match;
-						processingProgress = (parseInt(currentChunk) / parseInt(totalChunks)) * 100;
+					const chunk = decoder.decode(value);
+					const lines = chunk.split('\n\n');
+					for (const line of lines) {
+						if (line.startsWith('data: ')) {
+							const data = JSON.parse(line.slice(6));
+							processingProgress = data.progress;
+							uploadStatus = `Uploading ${file.name}: 100% | Processing: ${processingProgress.toFixed(2)}%`;
+						}
 					}
-
-					uploadStatus = `Uploading ${file.name}: ${uploadProgress.toFixed(2)}% | Processing: ${processingProgress.toFixed(2)}%`;
 				}
 
-				const result = await response.json();
-
-				if (result.success) {
-					uploadStatus = `Uploaded and processed ${file.name}`;
-					files = [...files, { name: file.name, type: file.type }];
-					dispatch('upload', [{ name: file.name, type: file.type }]);
-				} else {
-					throw new Error(result.error || 'Unknown error occurred');
-				}
+				uploadStatus = `Uploaded and processed ${file.name}`;
+				files = [...files, { name: file.name, type: file.type }];
+				dispatch('upload', [{ name: file.name, type: file.type }]);
 			} catch (error) {
 				console.error('Error uploading file:', error);
 				uploadStatus = `Error uploading ${file.name}: ${error.message}`;
